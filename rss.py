@@ -4,20 +4,22 @@ import asyncio
 import aiohttp
 import logging
 from datetime import datetime
+from urllib.parse import urlparse
 
 # ===== CONFIGURATION =====
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/RADACTED"  # Your main webhook
-SUCCESS_WEBHOOK_URL = "https://discord.com/api/webhooks/RADACTED"  # Webhook for success notification
-BOT_TOKEN = 'RADACTED' # Discord bot Token
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/REDACTED"
+SUCCESS_WEBHOOK_URL = "https://discord.com/api/webhooks/REDACTED"
+BOT_TOKEN = 'REDACTED'
 RSS_FILE = "rss.txt"
-CHECK_INTERVAL = 1200  # Check RSS feeds every 20 minutes
-SEND_INTERVAL = 5     # Send one message every 5 seconds to avoid rate limits
+CHECK_INTERVAL = 1200  # 20 minutes
+SEND_INTERVAL = 10
 
 # ===== SETUP =====
 logging.basicConfig(level=logging.INFO)
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 message_queue = asyncio.Queue()
+check_started = False  # Global guard for double loop
 sent_articles = set()
 
 # ===== UTILITY FUNCTIONS =====
@@ -37,6 +39,10 @@ def save_seen_entries(seen):
         for item in seen:
             f.write(item + "\n")
 
+def clean_link(url):
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
 # ===== DISCORD SEND WORKER =====
 async def discord_sender():
     while True:
@@ -52,7 +58,7 @@ async def discord_sender():
                         retry_after = int(response.headers.get("Retry-After", 10))
                         logging.warning(f"⏳ Rate limited. Waiting {retry_after}s")
                         await asyncio.sleep(retry_after)
-                        await message_queue.put((title, link))  # Retry later
+                        await message_queue.put((title, link))
                     else:
                         logging.error(f"❌ Failed to send ({response.status})")
             except Exception as e:
@@ -62,9 +68,7 @@ async def discord_sender():
 
 # ===== SUCCESS NOTIFICATION =====
 async def send_success_notification():
-    """Send a success notification to a different webhook."""
     payload = {'content': "Rss Tool run successful: All RSS feeds checked and processed."}
-
     async with aiohttp.ClientSession() as session:
         try:
             async with session.post(SUCCESS_WEBHOOK_URL, json=payload) as response:
@@ -79,17 +83,21 @@ async def send_success_notification():
 async def check_rss():
     seen = load_seen_entries()
     while True:
+        logging.info(f"--- Starting RSS check at {datetime.utcnow()} ---")
         rss_urls = read_rss_feeds(RSS_FILE)
         for url in rss_urls:
-            logging.info(f"Checking RSS: {url}")
+            logging.info(f"🔍 Checking RSS: {url}")
             feed = feedparser.parse(url)
 
             for entry in feed.entries:
-                entry_id = entry.get('id') or entry.get('link')
-                if not entry_id:
-                    continue
-
+                entry_id = (
+                    entry.get('id') or
+                    clean_link(entry.get('link', '')) or
+                    (entry.get('title', '') + entry.get('published', ''))
+                )
                 unique_key = f"{url}::{entry_id}"
+                logging.info(f"🔑 Unique key: {unique_key}")
+
                 if unique_key in seen:
                     continue
 
@@ -100,12 +108,18 @@ async def check_rss():
                 await message_queue.put((title, link))
 
         save_seen_entries(seen)
-        await send_success_notification()  # Send success message after checking all feeds
+        await send_success_notification()
+        logging.info(f"🛌 Sleeping for {CHECK_INTERVAL} seconds")
         await asyncio.sleep(CHECK_INTERVAL)
 
 # ===== BOT STARTUP =====
 @client.event
 async def on_ready():
+    global check_started
+    if check_started:
+        logging.warning("🛑 RSS check already running, skipping duplicate start")
+        return
+    check_started = True
     logging.info(f"🤖 Logged in as {client.user}")
     await asyncio.gather(check_rss(), discord_sender())
 
